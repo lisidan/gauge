@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"fmt"
 	"os"
 
 	"strings"
@@ -36,11 +37,41 @@ import (
 	"github.com/getgauge/gauge/track"
 	"github.com/getgauge/gauge/util"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 const (
-	lastRunCmdFileName = "lastRunCmd.json"
+	lastRunCmdFileName    = "lastRunCmd.json"
+	verboseDefault        = false
+	simpleConsoleDefault  = false
+	failedDefault         = false
+	repeatDefault         = false
+	parallelDefault       = false
+	sortDefault           = false
+	installPluginsDefault = true
+	environmentDefault    = "default"
+	tagsDefault           = ""
+	rowsDefault           = ""
+	strategyDefault       = "lazy"
+	groupDefault          = -1
+
+	verboseName        = "verbose"
+	simpleConsoleName  = "simple-console"
+	failedName         = "failed"
+	repeatName         = "repeat"
+	parallelName       = "parallel"
+	sortName           = "sort"
+	installPluginsName = "install-plugins"
+	environmentName    = "env"
+	tagsName           = "tags"
+	rowsName           = "table-rows"
+	strategyName       = "strategy"
+	groupName          = "group"
+	streamsName        = "n"
 )
+
+var overrideRerunFlags = []string{verboseName, simpleConsoleName, machineReadableName}
+var streamsDefault = util.NumberOfCores()
 
 type prevCommand struct {
 	Command []string
@@ -66,10 +97,11 @@ var (
 		Example: `  gauge run specs/
   gauge run --tags "login" -s -p specs/`,
 		Run: func(cmd *cobra.Command, args []string) {
-			handleRepeatCommand(cmd, os.Args)
-			if e := env.LoadEnv(environment); e != nil {
-				logger.Fatalf(true, e.Error())
+			if e := handleConflictingParams(cmd.Flags(), args); e != nil {
+				exit(e, "")
 			}
+			handleRepeatCommand(cmd, os.Args)
+			loadEnv()
 			if err := config.SetProjectRoot(args); err != nil {
 				exit(err, cmd.UsageString())
 			}
@@ -98,20 +130,20 @@ var (
 
 func init() {
 	GaugeCmd.AddCommand(runCmd)
-	runCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable step level reporting on console, default being scenario level")
-	runCmd.Flags().BoolVarP(&simpleConsole, "simple-console", "", false, "Removes colouring and simplifies the console output")
-	runCmd.Flags().StringVarP(&environment, "env", "e", "default", "Specifies the environment to use")
-	runCmd.Flags().StringVarP(&tags, "tags", "t", "", "Executes the specs and scenarios tagged with given tags")
-	runCmd.Flags().StringVarP(&rows, "table-rows", "r", "", "Executes the specs and scenarios only for the selected rows. It can be specified by range as 2-4 or as list 2,4")
-	runCmd.Flags().BoolVarP(&parallel, "parallel", "p", false, "Execute specs in parallel")
-	runCmd.Flags().IntVarP(&streams, "n", "n", util.NumberOfCores(), "Specify number of parallel execution streams")
-	runCmd.Flags().IntVarP(&group, "group", "g", -1, "Specify which group of specification to execute based on -n flag")
-	runCmd.Flags().StringVarP(&strategy, "strategy", "", "lazy", "Set the parallelization strategy for execution. Possible options are: `eager`, `lazy`")
-	runCmd.Flags().BoolVarP(&sort, "sort", "s", false, "Run specs in Alphabetical Order")
-	runCmd.Flags().BoolVarP(&installPlugins, "install-plugins", "i", true, "Install All Missing Plugins")
-	runCmd.Flags().BoolVarP(&failed, "failed", "f", false, "Run only the scenarios failed in previous run")
-	runCmd.Flags().BoolVarP(&repeat, "repeat", "", false, "Repeat last run")
-	runCmd.Flags().BoolVarP(&hideSuggestion, "hide-suggestion", "", false, "Prints a step implementation stub for every unimplemented step")
+	runCmd.Flags().BoolVarP(&verbose, verboseName, "v", verboseDefault, "Enable step level reporting on console, default being scenario level")
+	runCmd.Flags().BoolVarP(&simpleConsole, simpleConsoleName, "", simpleConsoleDefault, "Removes colouring and simplifies the console output")
+	runCmd.Flags().StringVarP(&environment, environmentName, "e", environmentDefault, "Specifies the environment to use")
+	runCmd.Flags().StringVarP(&tags, tagsName, "t", tagsDefault, "Executes the specs and scenarios tagged with given tags")
+	runCmd.Flags().StringVarP(&rows, rowsName, "r", rowsDefault, "Executes the specs and scenarios only for the selected rows. It can be specified by range as 2-4 or as list 2,4")
+	runCmd.Flags().BoolVarP(&parallel, parallelName, "p", parallelDefault, "Execute specs in parallel")
+	runCmd.Flags().IntVarP(&streams, streamsName, "n", streamsDefault, "Specify number of parallel execution streams")
+	runCmd.Flags().IntVarP(&group, groupName, "g", groupDefault, "Specify which group of specification to execute based on -n flag")
+	runCmd.Flags().StringVarP(&strategy, strategyName, "", strategyDefault, "Set the parallelization strategy for execution. Possible options are: `eager`, `lazy`")
+	runCmd.Flags().BoolVarP(&sort, sortName, "s", sortDefault, "Run specs in Alphabetical Order")
+	runCmd.Flags().BoolVarP(&installPlugins, installPluginsName, "i", installPluginsDefault, "Install All Missing Plugins")
+	runCmd.Flags().BoolVarP(&failed, failedName, "f", failedDefault, "Run only the scenarios failed in previous run. This is an exclusive flag, it cannot be used in conjunction with any other argument")
+	runCmd.Flags().BoolVarP(&repeat, repeatName, "", repeatDefault, "Repeat last run. This is an exclusive flag, it cannot be used in conjunction with any other argument")
+	runCmd.Flags().BoolVarP(&hideSuggestion, hideSuggestionName, "", hideSuggestionDefault, "Prints a step implementation stub for every unimplemented step")
 }
 
 //This flag stores whether the command is gauge run --failed and if it is triggering another command.
@@ -127,15 +159,36 @@ func loadLastState(cmd *cobra.Command) {
 	logger.Infof(true, "Executing => gauge %s\n", strings.Join(lastState, " "))
 	cmd.Parent().SetArgs(lastState)
 	os.Args = append([]string{"gauge"}, lastState...)
-	resetFlags()
+	handleFlags(cmd)
 	prevFailed = true
 	cmd.Execute()
 }
 
 func resetFlags() {
-	verbose, simpleConsole, failed, repeat, parallel, sort, hideSuggestion, installPlugins = false, false, false, false, false, false, false, true
-	environment, tags, rows, strategy, logLevel, dir = "default", "", "", "lazy", "info", "."
-	streams, group = util.NumberOfCores(), -1
+	verbose, simpleConsole, failed, repeat, parallel, sort, hideSuggestion, installPlugins =
+		verboseDefault, simpleConsoleDefault, failedDefault, repeatDefault, parallelDefault, sortDefault,
+		hideSuggestionDefault, installPluginsDefault
+	environment, tags, rows, strategy, logLevel, dir =
+		environmentDefault, tagsDefault, rowsDefault, strategyDefault, logLevelDefault, dirDefault
+	streams, group = streamsDefault, groupDefault
+}
+
+func overrideFlagList(cmd *cobra.Command) []string {
+	var flagsToBeSet = []string{}
+	setFlags := cmd.Flags()
+	setFlags.Visit(func(flag *pflag.Flag) {
+		if util.ListContains(overrideRerunFlags, flag.Name) && flag.Value.String() != flag.DefValue {
+			flagToSet := "--" + flag.Name + "=" + flag.Value.String()
+			flagsToBeSet = append(flagsToBeSet, flagToSet)
+		}
+	})
+	return flagsToBeSet
+}
+
+func handleFlags(cmd *cobra.Command) {
+	flags := overrideFlagList(cmd)
+	resetFlags()
+	os.Args = append(os.Args, flags...)
 }
 
 func installMissingPlugins(flag bool) {
@@ -169,7 +222,7 @@ func handleRepeatCommand(cmd *cobra.Command, cmdArgs []string) {
 var executeCmd = func(cmd *cobra.Command, lastState []string) {
 	cmd.Parent().SetArgs(lastState[1:])
 	os.Args = lastState
-	resetFlags()
+	handleFlags(cmd)
 	cmd.Execute()
 }
 
@@ -200,5 +253,30 @@ func writePrevCmd(cmdArgs []string) {
 	err = ioutil.WriteFile(prevCmdFile, []byte(contents), common.NewFilePermissions)
 	if err != nil {
 		logger.Fatalf(true, "Failed to write to %s. Reason: %s", prevCmdFile, err.Error())
+	}
+}
+
+func handleConflictingParams(setFlags *pflag.FlagSet, args []string) error {
+	flagDiffCount := 0
+	setFlags.Visit(func(flag *pflag.Flag) {
+		if !util.ListContains(overrideRerunFlags, flag.Name) && flag.DefValue != flag.Value.String() {
+			flagDiffCount++
+		}
+	})
+	if repeat && len(args)+flagDiffCount > 1 {
+		return fmt.Errorf("Invalid Command. Usage: gauge run --repeat")
+
+	}
+	if failed && len(args)+flagDiffCount > 1 {
+		return fmt.Errorf("Invalid Command. Usage: gauge run --failed")
+	}
+	return nil
+}
+
+func loadEnv() {
+	if !(repeat || failed) {
+		if e := env.LoadEnv(environment); e != nil {
+			logger.Fatalf(true, e.Error())
+		}
 	}
 }
